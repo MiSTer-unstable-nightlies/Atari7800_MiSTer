@@ -187,6 +187,16 @@ module sr_latch
 endmodule
 
 /////////////////////////////////////////////////////////////////////////////////////////
+// The die's F cell is two cross coupled latch stages gated by opposite halves
+// of tick. Both stages are transparent only while their own half is high, so
+// the pair collapses to two registers with no path from r_n/s_n to q:
+//
+//   tick low   master follows s_n / r_n     q = slave
+//   tick high  master holds                 q = ~master, slave <= ~master
+//
+// This is the same cycle for cycle behaviour the two sr_latch instances gave,
+// written so a cross coupled pair of cells is no longer a combinational loop
+// for Verilator and TimeQuest.
 module f_cell
 (
 	input  logic   clk,
@@ -197,27 +207,22 @@ module f_cell
 	output logic   q_n,
 	output logic   q
 );
-	logic q_in, qn_in;
+	logic master, slave;
 
-	sr_latch in_sr
-	(
-		.clk        (clk),
-		.reset      (reset),
-		.r          (~(tick || s_n)),
-		.s          (~(tick || r_n) || reset),
-		.q          (q_in),
-		.q_n        (qn_in)
-	);
+	assign q   = reset ? 1'd0 : (tick ? ~master : slave);
+	assign q_n = ~q;
 
-	sr_latch out_sr
-	(
-		.clk        (clk),
-		.reset      (reset),
-		.r          ((q_in && tick) || reset),
-		.s          (qn_in && tick),
-		.q          (q),
-		.q_n        (q_n)
-	);
+	always @(posedge clk) begin
+		if (tick)
+			slave  <= ~master;
+		else
+			master <= ~s_n ? 1'd0 : (~r_n ? 1'd1 : master);
+
+		if (reset) begin
+			master <= 1'd0;
+			slave  <= 1'd0;
+		end
+	end
 
 endmodule
 
@@ -467,7 +472,13 @@ module clockgen
 	output clock_t pclk, // CPU clock
 	output clock_t hclk, // Horizontal clock
 	output clock_t oclk,  // Oscillator Clock
-	output logic   phi0_ll
+	output logic   phi0_ll,
+	// The divider's own edges. Same as pclk.edge_p* in 2600 mode; in 7800 mode
+	// pclk follows pext_* and these do not. Every term below is a register, so
+	// there is no path from pext_* to here - which is what breaks the
+	// pext -> pclk -> phase controller -> pext ring. See the TIA phi*_gen pins.
+	output logic   pclk_gen_edge_p1,
+	output logic   pclk_gen_edge_p2
 );
 
 parameter PHI2_EXT = 0;
@@ -481,16 +492,24 @@ parameter PHI2_EXT = 0;
 logic oclk_tog;
 logic [2:0] pclk_div;
 logic pclock;
+// Held outside the struct: a clock_t is one signal to the linter, so a field
+// derived from another field of the same struct reads as a loop.
+logic oclk_clock, pclk_clock;
 wire pclk_edge = (oclk.edge_p1 || oclk.edge_p2);
 assign oclk.edge_p2 = oclk_tog && ce;
 assign oclk.edge_p1 = ~oclk_tog && ce;
-assign oclk.level_p1 = ~oclk.clock;
-assign oclk.level_p2 = oclk.clock;
+assign oclk.clock    = oclk_clock;
+assign oclk.level_p1 = ~oclk_clock;
+assign oclk.level_p2 = oclk_clock;
 
-assign pclk.edge_p2 = ((is_7800 || PHI2_EXT) ? pext_2 : (pclk_div == 2) && pclk_edge) && ~pclk.clock; // Phi0 // 0
-assign pclk.edge_p1 = (is_7800 ? pext_1 : (pclk_div == 5 || (resp0 && pclk_div == 0)) && pclk_edge) && pclk.clock; // Phi1 // 1
-assign pclk.level_p1 = ~pclk.clock;
-assign pclk.level_p2 = pclk.clock;
+assign pclk_gen_edge_p2 = ((pclk_div == 2) && pclk_edge) && ~pclk_clock;
+assign pclk_gen_edge_p1 = ((pclk_div == 5 || (resp0 && pclk_div == 0)) && pclk_edge) && pclk_clock;
+
+assign pclk.edge_p2 = (is_7800 || PHI2_EXT) ? (pext_2 && ~pclk_clock) : pclk_gen_edge_p2; // Phi0 // 0
+assign pclk.edge_p1 = is_7800 ? (pext_1 && pclk_clock) : pclk_gen_edge_p1; // Phi1 // 1
+assign pclk.clock    = pclk_clock;
+assign pclk.level_p1 = ~pclk_clock;
+assign pclk.level_p2 = pclk_clock;
 
 clock_t hclk_ll, hclk_hl;
 
@@ -502,6 +521,7 @@ f_counter hclk_counter
 	.tick       (oclk.edge_p2),
 	.clock      (hclk),
 	.f1_qn      (),
+	.f1_qn_edge (),
 	.f1_q_l     (rsynl)
 );
 
@@ -527,9 +547,9 @@ always_ff @(posedge clk) begin : phi0_gen
 	end
 
 	if (oclk.edge_p2) begin
-		oclk.clock <= 1;
+		oclk_clock <= 1;
 	end else if (oclk.edge_p1) begin
-		oclk.clock <= 0;
+		oclk_clock <= 0;
 	end
 
 	// CPU Clock
@@ -538,9 +558,9 @@ always_ff @(posedge clk) begin : phi0_gen
 	end
 
 	if (pclk.edge_p2)
-		pclk.clock <= 1'b1;
+		pclk_clock <= 1'b1;
 	else if (pclk.edge_p1)
-		pclk.clock <= 1'b0;
+		pclk_clock <= 1'b0;
 
 	if (hclk.edge_p2 && rsynd) begin
 		pclk_div <= 3'd2;
@@ -549,8 +569,8 @@ always_ff @(posedge clk) begin : phi0_gen
 	if (reset) begin
 		pclk_div <= 3'd4;
 		oclk_tog <= 0;
-		oclk.clock <= '0;
-		pclk.clock  <= 0;
+		oclk_clock <= '0;
+		pclk_clock <= 0;
 	end
 end
 
@@ -1313,7 +1333,6 @@ endmodule
 module priority_encoder
 (
 	input           clk,
-	input           ce,
 	input           p0,
 	input           m0,
 	input           p1,
@@ -1321,7 +1340,6 @@ module priority_encoder
 	input           pf,
 	input           bl,
 	input           blank,
-	input           decomb,
 	input           cntd,
 	input           pfp,
 	input           score,
@@ -1381,7 +1399,6 @@ module audio_channel
 (
 	input           clk,
 	input           reset,
-	input           ce,
 	input           aud0,
 	input           aud1,
 	input  [3:0]    volume,
@@ -1552,6 +1569,15 @@ module video_stabilize
 	localparam pal_vb_end = 9'd23; // 23
 	localparam ntsc_vb_start = 9'd240 + ntsc_vb_end; //9'd262;//9'd243;
 	localparam pal_vb_start = 9'd288 + pal_vb_end; //9'd312;//9'd288;
+	// Region detection, after Stella's FrameLayoutDetector. A 2600 image carries
+	// no region field, so the frame length the program produces is the only
+	// evidence - but one frame is not evidence. Frames are scored across
+	// 262..312 lines, odd counts count half because a real PAL field is even,
+	// startup and impossible frames are discarded, and the sums decide once.
+	localparam [8:0] lines_absurd   = 9'd412;  // pal + 100, Stella's own cutoff
+	localparam [5:0] score_span     = 6'd50;   // 312 - 262
+	localparam [5:0] garbage_frames = 6'd8;    // skipped while the kernel settles
+	localparam [5:0] detect_frames  = 6'd40;   // scored before the verdict stands
 
 
 	logic [8:0] v_count, total_lines, vsync_line, vsync_end_line;
@@ -1561,6 +1587,10 @@ module video_stabilize
 	logic [7:0] vsync_count, vblank_count, lines_from_vs;
 	logic [7:0] dot_count = 0;
 	logic vsync_emulate;
+	logic pal_mode;
+	logic region_done;
+	logic [5:0] region_frames;
+	logic [11:0] pal_sum, ntsc_sum;
 
 //	wire vblank_start = ~old_vblank && vblank_in;
 //	wire vblank_end   = old_vblank && ~vblank_in;
@@ -1574,7 +1604,17 @@ module video_stabilize
 	assign vblank = |mode ? vblank_in : vblank_en;
 	assign vsync = |mode ? vsync_in : vsync_en;
 	assign f1 = 1'b0; // |mode ? 1'b0 : midline_sync; // I could never make this work productively
-	assign auto_pal = total_lines >= 290;
+	// Decided once and then frozen. region_select drives the PLL, a PLL
+	// reconfiguration resets the core, and that restarts the very video measured
+	// here - so the region may move at most once per loaded ROM. `reset` covers
+	// the download, which is what re-arms detection for the next cart.
+	assign auto_pal = pal_mode;
+
+	// The frame that just ended is v_count lines long: 0 at 262 or below, the
+	// full span at 312 or above, proportional between, halved when odd.
+	wire [8:0] over_ntsc = (v_count > 9'd262) ? (v_count - 9'd262) : 9'd0;
+	wire [5:0] score_raw = (over_ntsc >= {3'b0, score_span}) ? score_span : over_ntsc[5:0];
+	wire [5:0] frame_score = v_count[0] ? {1'b0, score_raw[5:1]} : score_raw;
 
 	always_ff @(posedge clk) begin
 		old_hblank <= hblank_in;
@@ -1634,6 +1674,20 @@ module video_stabilize
 			v_count <= 0;
 			total_lines <= v_count;
 
+			if (!region_done) begin
+				region_frames <= region_frames + 1'd1;
+				// Startup frames and impossible ones are not evidence.
+				if (region_frames >= garbage_frames && v_count <= lines_absurd) begin
+					pal_sum  <= pal_sum  + {6'b0, frame_score};
+					ntsc_sum <= ntsc_sum + {6'b0, (score_span - frame_score)};
+				end
+				// One frame past the window, so the last score is counted.
+				if (region_frames == garbage_frames + detect_frames) begin
+					pal_mode <= pal_sum > ntsc_sum;
+					region_done <= 1'b1;
+				end
+			end
+
 			// if (dot_count > 15 && dot_count < 145) // Vsync outside of hblank can be considered invoking interlaced resolutions
 			// 	midline_sync <= 1;
 			// else
@@ -1647,6 +1701,11 @@ module video_stabilize
 			vsync_line <= 0;
 			vsync_override <= 0;
 			total_lines <= 9'd262;
+			pal_mode <= 1'b0;
+			region_done <= 1'b0;
+			region_frames <= 6'd0;
+			pal_sum <= 12'd0;
+			ntsc_sum <= 12'd0;
 			v_count <= 0;
 			vblank_en <= 1;
 			vsync_en <= 0;
@@ -1668,7 +1727,8 @@ module TIA
 	output logic    rdy,
 	input  [5:0]    addr,
 	input  [7:0]    d_in,
-	output [7:0]    d_out,
+	output logic [7:0] d_out,
+	output logic [7:0] d_out_oe, // Which of D7:D0 the chip is actually driving
 	input  [3:0]    i,     // On real hardware, these would be ADC pins. i0..3
 	output [3:0]    i_out,
 	input           i4,
@@ -1692,7 +1752,15 @@ module TIA
 	output          vsync,
 	output          hsync,
 	input           phi1_in,
-	input [7:0]     open_bus,
+	// phi0/phi1 above are the chip's pins: in 7800 mode they echo the pair
+	// MARIA supplies, which is what the silicon does and what
+	// tia_clock_boundary_tb guards. Feeding that echo back to the core's phase
+	// controller closes a combinational ring, so the controller reads these
+	// instead - the divider's own phase, with no path from phi1_in/phi2. In
+	// 2600 mode, the only mode the controller selects the TIA in, they are the
+	// same signals.
+	output          phi0_gen,
+	output logic    phi1_gen,
 	input           is_7800,
 	input           decomb,
 	output logic    cart_ce,
@@ -1739,7 +1807,6 @@ assign BLK_n = blank;
 assign sync = ~(hsync || vsync);
 assign vsync_o = wreg[VSYNC][1];
 assign vblank_o = wreg[VBLANK][1];
-assign d_out[5:0] = open_bus[5:0];
 assign cart_ce = oclk.edge_p2;
 assign motck = ~oclk.clock & ~hblank_d;
 assign clkp = ~oclk.clock;
@@ -1866,18 +1933,28 @@ end
 // The bus drivers are asynchronous. Their stored sources live in rreg, but
 // registering the pin value on phase 2 makes it arrive after the CPU closes
 // its data latch on that same edge.
+// D5:D0 have no drivers at all in the part, and the collision registers and
+// the trigger inputs reach only D7, so most reads leave part of the byte to
+// whatever charge the bus already carries. d_out_oe says which bits are real;
+// the system bus fills the rest.
 always_comb begin
-	d_out = open_bus;
+	d_out = 8'h00;
+	d_out_oe = 8'h00;
 	if (cs && RW_n) begin
-		if (addr[3:0] == INPT4 && ~wreg[VBLANK][6])
+		if (addr[3:0] == INPT4 && ~wreg[VBLANK][6]) begin
 			d_out[7] = i4;
-		else if (addr[3:0] == INPT5 && ~wreg[VBLANK][6])
+			d_out_oe = 8'b1000_0000;
+		end else if (addr[3:0] == INPT5 && ~wreg[VBLANK][6]) begin
 			d_out[7] = i5;
-		else if (~&addr[3:1]) begin
-			if (addr[3] || addr[3:0] == CXBLPF)
+			d_out_oe = 8'b1000_0000;
+		end else if (~&addr[3:1]) begin // $xE and $xF decode to nothing
+			if (addr[3] || addr[3:0] == CXBLPF) begin
 				d_out[7] = rreg[addr[3:0]][7];
-			else
+				d_out_oe = 8'b1000_0000;
+			end else begin
 				d_out[7:6] = rreg[addr[3:0]][7:6];
+				d_out_oe = 8'b1100_0000;
+			end
 		end
 	end
 end
@@ -1921,7 +1998,10 @@ clockgen clockgen
 	.pext_2     (phi2),
 	.pclk       (pclk),
 	.hclk       (hclk),
-	.oclk       (oclk)
+	.oclk       (oclk),
+	.phi0_ll    (),  // reference divider, tied off - see clockgen
+	.pclk_gen_edge_p1 (phi1_gen),
+	.pclk_gen_edge_p2 (phi0_gen)
 );
 
 horiz_gen h_gen
@@ -1940,7 +2020,8 @@ horiz_gen h_gen
 	.aud0       (aclk0),
 	.aud1       (aclk1),
 	.shb        (shb),
-	.rhb        (rhb)
+	.rhb        (rhb),
+	.CB         ()   // colour burst gate, unused outside horiz_gen
 );
 
 playfield playfield
@@ -2072,9 +2153,9 @@ audio_channel audio0
 	.reset      (rst),
 	.aud0       (aclk0),
 	.aud1       (aclk1),
-	.volume     (wreg[AUDV0]),
-	.freq       (wreg[AUDF0]),
-	.audc       (wreg[AUDC0]),
+	.volume     (wreg[AUDV0][3:0]),
+	.freq       (wreg[AUDF0][4:0]),
+	.audc       (wreg[AUDC0][3:0]),
 	.audio      (aud0)
 );
 
@@ -2084,9 +2165,9 @@ audio_channel audio1
 	.reset      (rst),
 	.aud0       (aclk0),
 	.aud1       (aclk1),
-	.volume     (wreg[AUDV1]),
-	.freq       (wreg[AUDF1]),
-	.audc       (wreg[AUDC1]),
+	.volume     (wreg[AUDV1][3:0]),
+	.freq       (wreg[AUDF1][4:0]),
+	.audc       (wreg[AUDC1][3:0]),
 	.audio      (aud1)
 );
 

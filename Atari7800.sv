@@ -36,6 +36,8 @@ wire clk_vid;
 wire clk_sys;
 wire clk_tia;
 wire clk_arm;
+wire [63:0] reconfig_to_pll, reconfig_from_pll;
+logic       pll_busy = 1'b0;   // holds the core in reset across a PLL relock
 
 pll pll
 (
@@ -45,7 +47,9 @@ pll pll
 	.outclk_1(clk_vid),
 	.outclk_2(clk_tia),
 	.outclk_3(clk_arm),
-	.locked(clock_locked)
+	.locked(clock_locked),
+	.reconfig_to_pll(reconfig_to_pll),
+	.reconfig_from_pll(reconfig_from_pll)
 );
 
 // 7.1590909 = NTSC pixel clock
@@ -70,7 +74,8 @@ end
 // leaves only 3.5 ns to get there.
 always @(posedge clk_sys) begin
 	reset <= RESET | buttons[1] | status[0] | cart_download | bios_download |
-		status[48] | old_cart_download | mapper_init_busy;
+		status[48] | old_cart_download | mapper_init_busy |
+		pll_busy | ~clock_locked;
 end
 
 
@@ -109,8 +114,10 @@ parameter CONF_STR = {
 	"P1O9B,Scandoubler Fx,None,HQ2x,CRT 25%,CRT 50%,CRT 75%;",
 	"P1OT,Show Overscan,No,Yes;",
 	"P1OE,Show Border,Yes,No;",
-	"P1OK,Composite Blending,No,Yes;",
 	"P1O[74],Composite Filter,Off,On;",
+	"H4P1O[65:64],Composite Smear,1,2,3;",
+	"H4P1O[77],Composite AGC,On,Off;",
+	"H4P1O[78],Composite Comb,Off,On;",
 	"P1OUV,Temperature Colors,Warm,Cool,Hot,Custom;",
 	"H3P1FC3,PAL,Load Palette;",
 	"P2,Peripherals;",
@@ -134,15 +141,17 @@ parameter CONF_STR = {
 	"D2P4oV,Stabilize Video,On,Off;",
 	"D2P4oF,De-comb,Off,On;",
 	"D2P4oU,Black & White,Off,On;",
-	"D2P4oOS,Bankswitching,Auto,F8,F6,FE,E0,3F,F4,P2,FA,CV,2K,UA,E7,F0,32,AR,3E,SB,WD,EF,JANE,DPC+,CTY,CDF,BUS,FA2;",
+	"D2P4oOS,Bankswitching,Auto,F8,F6,FE,E0,3F,F4,P2,FA,CV,2K,UA,E7,F0,32,AR,3E,SB,WD,EF,JANE,DPC+,CTY,CDF,BUS,FA2,0840,FC,DF/BF,Multi 2K,Multi 4K,Multi 8K;",
 	"P4oN,Fix SC File Checksums,Off,On;",
 	"D2P4-;",
 	"D2P4rG,Load Tape From ADC;",
 	"P3,Advanced;",
 	"P3OH,Bypass Bios,Yes,No;",
+	"P3O[76],Boot Without Cart,Internal ROM,BIOS;",
 	"P3O1,Clear Memory,Zero,Random;",
 	"P3O8,Pokey IRQ Enabled,No,Yes;",
 	"P3O[73],Minnie Sound Chip,Off,On;",
+	"P3O[75],Minnie Address,$460,$434;",
 	"D2P3OL,CPU Driver,TIA,Maria;",
 	"-;",
 	"o3,Pause Core on OSD,Off,On;",
@@ -241,7 +250,7 @@ hps_io #(.CONF_STR(CONF_STR)) hps_io
 	.status             (status),
 	.status_set         (status_set),
 	.status_in          (status_in),
-	.status_menumask    ({status[31:30] != 3,~tia_en,(is_snac0 | is_snac1),en216p}),
+	.status_menumask    ({~status[74],status[31:30] != 3,~tia_en,(is_snac0 | is_snac1),en216p}),
 
 	.ioctl_addr         (ioctl_addr),
 	.ioctl_dout         (ioctl_dout),
@@ -279,10 +288,11 @@ wire VBlank, VBlank_orig;
 wire [15:0] bios_addr;
 reg [7:0] cart_data, bios_data;
 reg [7:0] joy0_type, joy1_type, cart_region, cart_save;
+reg [7:0] header_version, header_mapper;
 
 logic [15:0] cart_flags;
 logic [39:0] cart_header;
-logic [31:0] cart_size;
+logic [31:0] cart_size;      // cartridge extent the core sees (decision 0066)
 logic [24:0] cart_addr;
 logic [7:0] cart_xm;
 logic cart_busy;
@@ -292,13 +302,23 @@ reg cart_loaded = 0;
 logic RW;
 
 logic cart_is_7800;
+
+// Until a cart is loaded the slot holds the built-in splash ROM. This option
+// empties it and runs the BIOS instead, whatever Bypass Bios says, so a BIOS
+// with a built-in game (Asteroids proto, PacManPlus) can reach it. The splash
+// ROM is signed, so a BIOS that still saw it would just launch it.
+wire bios_boot = status[76] && ~cart_loaded;
+
+// Byte 64 is only a mapper field from header v4 on, and only for a 7800 image.
+wire [7:0] cart_mapper = (cart_is_7800 && header_version >= 8'd4) ? header_mapper : 8'd0;
+
 logic [7:0] hsc_ram_dout, din;
 logic hsc_ram_cs;
 logic tia_mode;
 logic ce_pix_raw;
 logic [7:0] cart_din;
 logic cart_rw;
-wire [4:0] force_bs;
+wire [5:0] force_bs;
 wire [2:0] mapper_revision;
 wire cdf_ldx;
 wire cdf_ldy;
@@ -315,6 +335,94 @@ wire PAread;
 lfsr #(.N(15)) random(rnd);
 
 wire region_select = ~|status[16:15] ? (tia_en ? tia_pal : cart_region[0]) : status[16];
+
+// PAL is a real clock rather than a stolen
+// MARIA cycle. NTSC and PAL differ in exactly one PLL value - the fractional
+// part of M - so every counter, and therefore clk_vid = 4 x clk_sys and
+// clk_arm = 5 x clk_sys, is identical across the switch.
+//
+// The two constants are the whole clock specification, so they are derived
+// from the real machines rather than from what the IP wizard happened to pick:
+//
+//   NTSC  clk_sys is the crystal, 4 x the 315/88 MHz colour subcarrier
+//                  = 14.318181818... MHz, MARIA 7.159090909...
+//   PAL   crystal is 4 x the 4.43361875 MHz subcarrier and MARIA is 2/5 of it
+//                  = 7.09379 MHz exactly, clk_sys 14.18758
+//
+// clk_sys = 50 * (11 + frac/2^32) / 40, so the fractions below are those two
+// frequencies to the full resolution of the 32 bit fraction: NTSC lands within
+// 4e-6 ppm and PAL within 1e-5 ppm, about a ten millionth of the +/-50 ppm the
+// board's own 50 MHz oscillator is specified to. Do not round these to the
+// wizard's suggestions - a rounded request cost 124 ppm on NTSC before this.
+//
+// The PLL is programmed once at power-up as well as on every region change, so
+// these constants, not whatever value is baked into the generated IP, decide
+// the clock.
+//
+// This runs on CLK_50M, not clk_sys: clk_sys is what stops while the PLL
+// relocks, so a machine clocked from it could not finish the sequence.
+localparam [31:0] PLL_FRAC_NTSC = 32'd1952257862;
+localparam [31:0] PLL_FRAC_PAL  = 32'd1503513432;
+
+wire        cfg_waitrequest;
+logic       cfg_write = 1'b0;
+logic [5:0] cfg_address = 6'd0;
+logic [31:0] cfg_writedata = 32'd0;
+
+pll_cfg pll_cfg
+(
+	.mgmt_clk         (CLK_50M),
+	.mgmt_reset       (1'b0),
+	.mgmt_waitrequest (cfg_waitrequest),
+	.mgmt_read        (1'b0),
+	.mgmt_readdata    (),
+	.mgmt_write       (cfg_write),
+	.mgmt_address     (cfg_address),
+	.mgmt_writedata   (cfg_writedata),
+	.reconfig_to_pll  (reconfig_to_pll),
+	.reconfig_from_pll(reconfig_from_pll)
+);
+
+// Avalon map of altera_pll_reconfig: 2 starts a reconfiguration, 7 carries the
+// fractional M value. This is the one part of decision 0088 that no simulation
+// here can check - the PLL is not in the Verilator model - so it wants
+// confirming on hardware.
+logic [1:0] pll_region_sync = 2'b00;
+logic       pll_region_applied = 1'b0;
+logic       pll_primed = 1'b0;           // program once at power-up regardless
+logic [1:0] pll_step = 2'd0;
+
+always @(posedge CLK_50M) begin
+	pll_region_sync <= {pll_region_sync[0], region_select};
+
+	cfg_write <= 1'b0;
+	if (!pll_busy) begin
+		if (!pll_primed || pll_region_sync[1] != pll_region_applied) begin
+			pll_busy <= 1'b1;
+			pll_step <= 2'd0;
+		end
+	end else if (!cfg_waitrequest && !cfg_write) begin
+		case (pll_step)
+			2'd0: begin
+				cfg_address   <= 6'd7;
+				cfg_writedata <= pll_region_sync[1] ? PLL_FRAC_PAL : PLL_FRAC_NTSC;
+				cfg_write     <= 1'b1;
+				pll_step      <= 2'd1;
+			end
+			2'd1: begin
+				cfg_address   <= 6'd2;
+				cfg_writedata <= 32'd0;
+				cfg_write     <= 1'b1;
+				pll_step      <= 2'd2;
+			end
+			default: begin
+				pll_region_applied <= pll_region_sync[1];
+				pll_primed         <= 1'b1;
+				pll_busy           <= 1'b0;
+			end
+		endcase
+	end
+end
 logic [3:0] iout;
 logic tia_hsync;
 logic tia_pal, tia_f1;
@@ -351,7 +459,6 @@ logic use_sk;
 
 logic core_paused;
 logic freeze_sync;
-logic cpu_ce;
 
 logic fa2_nvram_request;
 logic fa2_nvram_write;
@@ -363,8 +470,8 @@ logic fa2_nvram_dirty;
 logic arm_load_wait;
 logic mapper_init_busy;
 
-wire [4:0] selected_2600_mapper = cart_is_7800 ? BANK00 :
-	(use_tape ? BANKAR : (|status[60:56] ? status[60:56] : force_bs));
+wire [5:0] selected_2600_mapper = cart_is_7800 ? BANK00 :
+	(use_tape ? BANKAR : (|status[60:56] ? {1'b0, status[60:56]} : force_bs));
 
 always_ff @(posedge clk_sys) begin :core_sync
 	reg old_sync;
@@ -444,9 +551,11 @@ Atari7800 main
 	.PAL          (region_select),
 	.pal_temp     (status[31:30]),
 	.tia_mode     (tia_mode && ~status[17]),
-	.bypass_bios  (~status[17]),
+	.bypass_bios  (~status[17] && ~bios_boot),
+	.cart_present (~bios_boot),
 	.pokey_irq    (status[8]),
 	.minnie_en    (status[73]),
+	.minnie_alt   (status[75]),
 	.hsc_en       (~use_sk && (~|status[19:18] && (|cart_save || cart_xm[0]) ? 1'b1 : status[18])),
 	.hsc_ram_dout (hsc_ram_dout),
 	.hsc_ram_cs   (hsc_ram_cs),
@@ -461,6 +570,7 @@ Atari7800 main
 	.cart_size    (cart_size),
 	.cart_addr_out(cart_addr),
 	.cart_flags   (cart_is_7800 ? cart_flags[15:0] : 16'd0),
+	.cart_mapper  (cart_mapper),
 	.cart_save    (cart_save),
 	.cart_din     (cart_din),
 	.cart_xm      (cart_is_7800 ? cart_xm : 8'h0),
@@ -536,7 +646,7 @@ Atari7800 main
 	.clearval     (status[1] ? rval : 8'h00),
 	.random       (rval),
 	.decomb       (status[47]),
-	.mapper       (5'd0),
+	.mapper       (6'd0),
 	.tape_in      ({use_tape, tape_adc}),
 	.fix_sc_cs    (status[55]),
 
@@ -575,35 +685,31 @@ detect2600 detect2600
 
 initial begin
 	cart_header = "ATARI";
-	cart_size = 32'h00008000;
 	cart_flags = 0;
 	cart_region = 0;
 	bios_mask = 0;
 	cart_save = 0;
 	cart_xm = 0;
 	tia_mode = 0;
+	header_version = 0;
+	header_mapper = 0;
 end
 
 always_ff @(posedge clk_sys) begin
 	cart_is_7800 <= (cart_header == "ATARI");
 	if (bios_download && ioctl_wr) // This assumes bootrom is always power of two
 		bios_mask <= ioctl_addr[14:0];
-	if (cart_download && ioctl_wr)
-		cart_size <= (ioctl_addr - (cart_is_7800 ? 8'd128 : 1'b0)) + 1'd1; // 32 bit 1
 	if (cart_download) begin
 		tia_mode <= ioctl_index[7:6] != 0;
 		cart_loaded <= 1;
 		if (!tia_mode) begin
 			case (ioctl_addr)
+				'd00: header_version <= ioctl_dout;
 				'd01: cart_header[39:32] <= ioctl_dout;
 				'd02: cart_header[31:24] <= ioctl_dout;
 				'd03: cart_header[23:16] <= ioctl_dout;
 				'd04: cart_header[15:8] <= ioctl_dout;
 				'd05: cart_header[7:0] <= ioctl_dout;
-				// 'd49: hcart_size[31:24] <= ioctl_dout;
-				// 'd50: hcart_size[23:16] <= ioctl_dout;
-				// 'd51: hcart_size[15:8] <= ioctl_dout;
-				// 'd52: hcart_size[7:0] <= ioctl_dout;
 				'd53: cart_flags[15:8] <= ioctl_dout;
 				'd54: cart_flags[7:0] <= ioctl_dout;
 				'd55: joy0_type <= ioctl_dout;   // 0=none, 1=joystick, 2=lightgun
@@ -611,6 +717,9 @@ always_ff @(posedge clk_sys) begin
 				'd57: cart_region <= ioctl_dout; // 0=ntsc, 1=pal
 				'd58: cart_save <= ioctl_dout;   // 0=none, 1=high score cart, 2=savekey
 				'd63: cart_xm <= ioctl_dout; // 1 = Has XM
+				// Only v4 defines a mapper here; in a v2/v3 header byte 64 is
+				// part of the title, so it must not be read as one.
+				'd64: header_mapper <= ioctl_dout;
 			endcase
 			if (!cart_is_7800) begin
 				joy0_type <= 8'd1;
@@ -624,9 +733,24 @@ always_ff @(posedge clk_sys) begin
 			cart_region <= 0;
 			cart_save <= 0;
 			cart_xm <= 0;
+			header_version <= 0;
+			header_mapper <= 0;
 		end
 	end
 end
+
+// Decision 0066: the declared A78 size may only shrink the cartridge.
+a78_cart_extent cart_extent
+(
+	.clk           (clk_sys),
+	.cart_download (cart_download),
+	.ioctl_wr      (ioctl_wr),
+	.ioctl_addr    (ioctl_addr),
+	.ioctl_dout    (ioctl_dout),
+	.cart_is_7800  (cart_is_7800),
+	.tia_mode      (ioctl_index[7:6] != 0),
+	.cart_size     (cart_size)
+);
 
 logic [24:0] cart_write_addr, fixed_addr;
 assign cart_write_addr = (ioctl_addr >= 8'd128) && cart_is_7800 ? (ioctl_addr[24:0] - 8'd128) : ioctl_addr[24:0];
@@ -1119,30 +1243,7 @@ end
 
 ////////////////////////////  VIDEO  ////////////////////////////////////
 
-logic hb_cofi, hs_cofi, vb_cofi, vs_cofi;
-logic [7:0] r_cofi, g_cofi, b_cofi;
 reg ce_pix;
-
-cofi coffee (
-	.clk        (CLK_VIDEO),
-	.pix_ce     (ce_pix),
-	.enable     (status[20]),
-	.hblank     (HBlank),
-	.vblank     (VBlank),
-	.hs         (HSync),
-	.vs         (VSync),
-	.red        (R),
-	.green      (G),
-	.blue       (B),
-
-	.hblank_out (hb_cofi),
-	.vblank_out (vb_cofi),
-	.hs_out     (hs_cofi),
-	.vs_out     (vs_cofi),
-	.red_out    (r_cofi),
-	.green_out  (g_cofi),
-	.blue_out   (b_cofi)
-);
 
 assign VGA_F1 = tia_f1;
 assign CLK_VIDEO = clk_vid;
@@ -1237,6 +1338,10 @@ wire ce_comp = comp_tog_d ^ comp_tog_d2;
 
 wire use_composite = status[74];
 
+// Menu lists "1,2,3" (0 does nothing), so smear is the list index plus one
+// and a zeroed status lands on the default of 1.
+wire [3:0] comp_smear_lvl = {2'd0, status[65:64]} + 4'd1;
+
 video_mixer_plus #(.LINE_LENGTH(372), .HALF_DEPTH(0), .GAMMA(1), .COMP_SPC(4)) video_mixer
 (
 	.*,
@@ -1253,28 +1358,25 @@ video_mixer_plus #(.LINE_LENGTH(372), .HALF_DEPTH(0), .GAMMA(1), .COMP_SPC(4)) v
 	.comp_burst_len  (comp_burst_len),
 	.comp_sat        (8'd128),
 	.comp_hue        (8'd0),
-	.comp_smear      (4'd3),
+	.comp_smear      (comp_smear_lvl),
 	.comp_luma_delay (4'd2),
 	// The 7800 has no setup, like NTSC-J; NTSC-M would be 439.
 	.comp_setup      (16'd0),
 	.comp_luma_gain  (16'd2857),
-	// AGC off for this hardware. It keys on the burst, which NTSC gives the same
-	// amplitude as sync - but the board does not: the ladder puts sync at 0.2752
-	// of the logic high against a burst of 0.1255, so the burst is 0.456 of sync
-	// where the standard says 1.000. Keyed on that, AGC would mis-scale by more
-	// than two to one. It stays available for sources that are in spec.
-	.comp_agc        (1'b0),
+	// AGC defaults on (the menu lists On first, so a zeroed status selects it).
+	.comp_agc        (~status[77]),
+	.comp_comb       (status[78]),
 
 	.VGA_DE(vga_de),
 	.hq2x(scale==1),
-	.HSync(hs_cofi),
-	.HBlank(hb_cofi),
-	.VSync(vs_cofi),
-	.VBlank(vb_cofi),
+	.HSync(HSync),
+	.HBlank(HBlank),
+	.VSync(VSync),
+	.VBlank(VBlank),
 
-	.R((gun_en & gun_target) ? 8'd255 : r_cofi),
-	.G((gun_en & gun_target) ? 8'd0 : g_cofi),
-	.B((gun_en & gun_target) ? 8'd0 : b_cofi)
+	.R((gun_en & gun_target) ? 8'd255 : R),
+	.G((gun_en & gun_target) ? 8'd0 : G),
+	.B((gun_en & gun_target) ? 8'd0 : B)
 );
 
 /////////////////////////  STATE SAVE/LOAD  /////////////////////////////
@@ -1350,11 +1452,17 @@ EEPROM_24LC0X
 	.ram_done       (1)
 );
 
-dpram_dc #(.widthad_a(14)) hsc_ram
+// 15 bits, not 14: the SaveKey is a 24LC256 with a 15-bit address, and the
+// save transfer below walks sd_lba 0..63 - 64 sectors, 32 KiB. At 14 bits both
+// wrapped, so the SaveKey's upper half aliased onto its lower half and the
+// second half of every save file overwrote the first on load.
+dpram_dc #(.widthad_a(15)) hsc_ram
 (
 	.clock_a   (clk_sys),
-	.address_a (fa2_backing_cs ? {6'd0, fa2_backing_addr} :
-		(use_sk ? sk_ram_addr : bios_addr)),
+	// The HSC shares this port and arrives on the 16-bit system bus; it lives
+	// at $1000-$17FF, so dropping A15 is exact.
+	.address_a (fa2_backing_cs ? {7'd0, fa2_backing_addr} :
+		(use_sk ? sk_ram_addr : bios_addr[14:0])),
 	.data_a    (fa2_backing_cs ? fa2_backing_wdata :
 		(use_sk ? sk_ram_do : din)),
 	.wren_a    (fa2_backing_cs ? fa2_backing_write :
@@ -1362,7 +1470,7 @@ dpram_dc #(.widthad_a(14)) hsc_ram
 	.q_a       (hsc_ram_dout),
 
 	.clock_b   (clk_sys),
-	.address_b ({sd_lba[0][5:0],sd_buff_addr}),
+	.address_b ({sd_lba[0][5:0], sd_buff_addr}),
 	.data_b    (sd_buff_dout),
 	.wren_b    (sd_buff_wr & sd_ack),
 	.q_b       (sd_buff_din[0])
